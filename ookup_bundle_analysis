@@ -1,0 +1,197 @@
+<form>
+  <label>Splunk_PS_bundle_analysis_healthcheck</label>
+  <fieldset submitButton="false">
+    <input type="dropdown" token="splunk_server_group_tok" searchWhenChanged="true">
+      <label>splunk_server_group</label>
+      <choice value="*">All</choice>
+      <prefix>splunk_server_group=</prefix>
+      <fieldForLabel>splunk_server_group</fieldForLabel>
+      <fieldForValue>splunk_server_group</fieldForValue>
+      <search>
+        <query>|  rest  splunk_server=local /servicesNS/-/-/configs/conf-distsearch splunk_server_group=* | fields  title | where match(title,"distributedSearch:dmc_search.+") | rex field=title "distributedSearch:(?&lt;splunk_server_group&gt;\S+)" | fields - title</query>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </search>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <html>
+      <h3>Active Lokoup Tables</h3>
+  <p/>
+  Description: This is a list of lookups that have been created or updated in the last 15 days.   Active lookups will contribute both to increased bundle size and increased bundle replication activity.   Very large or very frequently updated tables should be targets for blacklisting in distsearch.conf.
+</html>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <table>
+        <title>Lookup table latest sizes</title>
+        <search>
+          <query>index=_audit action=add OR action=update* OR action=delete path=*lookups* host!=*dpl* NOT isdir=1 path!=*lookup_file_backups*
+| join type=outer host 
+    [| rest splunk_server=local /servicesNS/-/-/configs/conf-distsearch 
+    | where match(title,"distributedSearch:dmc_search.+") 
+    | fields title servers 
+    | rename title as search_head_group 
+    | eval servers=split(servers,",") 
+    | mvexpand servers 
+    | rename servers as host_ip 
+    | rex field=host_ip "(?&lt;host_ip&gt;.*):8089" 
+    | join type=outer host_ip 
+        [| rest splunk_server=local /servicesNS/-/-/search/distributed/peers 
+        | fields title host 
+        | rex field=title "(?&lt;host_ip&gt;.*):8089" 
+        | fields host host_ip]] 
+| eval locally_indexed_due_to_size=if(match(path,".*\.index.*"),"yes",null()) 
+| eval size=if(match(path,".*\.index.*"),0,size)
+| rex field=path "(?&lt;path&gt;.*)_\d+\.index"
+| stats count as unique_actions sum(eval(if(match(action,"delete"),1,0))) as deletes max(size) as max_size last(action) as latest_action last(host) as host last(host_ip) as host_ip values(locally_indexed_due_to_size) as locally_indexed_due_to_size by path, search_head_group 
+| rename max_size as max_size_mb
+| search  max_size_mb&gt;0 | eval max_size_mb=round(max_size_mb/(1024*1024),2) | rename search_head_group as splunk_server_group | rex field=splunk_server_group "distributedSearch:(?&lt;splunk_server_group&gt;.*)" | search  $splunk_server_group_tok$  | dedup path, splunk_server_group| fields - splunk_server_group
+| eval scope=if(match(path,"\/opt\/splunk\/etc\/users.*"),"private","shared")
+| rex field=path "\/opt\/splunk\/etc\/apps\/(?&lt;app&gt;[^\/]+)\/lookups\/(?&lt;lookup_name&gt;.*)"
+| rex field=path "\/opt\/splunk\/etc\/users\/[^\/]+\/(?&lt;app&gt;[^\/]+)\/lookups\/(?&lt;lookup_name&gt;.*)"
+| fields lookup_name max_size_mb unique_actions deletes app scope host locally_indexed_due_to_size path
+| join type=outer lookup_name [|  rest  /servicesNS/-/-/saved/searches splunk_server_group=$splunk_server_group_tok$ | fields title search eai:acl.owner eai:acl.app splunk_server splunk_server_group | rename eai:acl.app as appname, eai:acl.owner as owner
+| search (search=*qhost_id_asset_groups* OR search=*ITA_SMS_existing_flag_true_20200116* 
+OR search=*ITA_SMS_existing_flag_true_20200316* OR search=*iochash* OR search=*qualys_kb* OR search=*gis_and_unknown_inventory*) | where match(search,"\|\s*lookup") AND NOT match(search,"\|\s*lookup\s+local\s*=\s*true") | dedup title appname
+| rex field=search max_match=0 "\|\s*lookup\s+(?&lt;lookup_names&gt;\S+)" 
+| mvexpand lookup_names | rename lookup_names as lookup_name, title as savedsearch_name
+| rex field=lookup_name "(?&lt;lookup_name&gt;.*)\.csv"
+| append [|  rest  /servicesNS/-/-/data/props/lookups splunk_server_group=$splunk_server_group_tok$ | rename eai:acl.app as appname, eai:acl.owner as owner | fields transform appname owner | join type=outer transform [|  rest  /servicesNS/-/-/data/transforms/lookups splunk_server_group=dmc_searchheadclustergroup_am_ah_shc |fields title filename | rename title as transform, filename as lookup_name | rex field=lookup_name "(?&lt;lookup_name&gt;.*)\.csv"]]
+| fields lookup_name | eval lookup_name=lookup_name.".csv" | eval must_be_in_bundle="True"]
+| eval  [| rest /servicesNS/-/-/configs/conf-distsearch splunk_server_group=dmc_searchheadclustergroup_am_ah_shc 
+    | search title=replicationBlacklist splunk_server!=*dply*
+    | head 1 
+    | transpose 
+    | rename "row 1" as regex 
+    | where len(regex)&gt;1 
+    | search (column!=author column!=splunk_server column!=title column!=updated column!="eai:acl.app" column!="eai:acl.owner" column!="eai:acl.perms.write" column!=eai:acl.sharing column!=eai:appName column!=eai:userName) 
+    | table regex 
+    | mvcombine regex 
+    | eval regex=mvjoin(regex, "|")
+    | return regex] 
+| eval regex=replace(regex, "\*", "[^/]*")
+| eval regex=replace(regex, "\.\.\.", ".*")
+| eval res=if(match(path, regex ),"blacklisted", "not blacklisted")  
+ | sort - max_size_mb
+| fields - path regex| sort - max_size_mb
+| join type=outer lookup_name [|  rest  /servicesNS/-/-/saved/searches $splunk_server_group_tok$
+ | fields title search eai:acl.owner eai:acl.app splunk_server splunk_server_group | rename eai:acl.app as appname, eai:acl.owner as owner splunk_server as host
+ 
+ 
+ | where match(search,"\|\s*lookup") AND NOT match(search,"\|\s*lookup\s+local\s*=\s*true") | dedup title appname
+| rex field=search max_match=0 "\|\s*lookup\s+(?&lt;lookup_names&gt;\S+)" 
+| mvexpand lookup_names | rename lookup_names as lookup_name, title as savedsearch_name
+| rex field=lookup_name "(?&lt;lookup_name&gt;.*)\.csv"
+| append [|  rest $splunk_server_group_tok$ /servicesNS/-/-/data/props/lookups  | rename eai:acl.app as appname, eai:acl.owner as owner | fields transform appname owner splunk_server | rename splunk_server as host | join type=outer transform [|  rest  /servicesNS/-/-/data/transforms/lookups $splunk_server_group_tok$ |fields title filename | rename title as transform, filename as lookup_name | rex field=lookup_name "(?&lt;lookup_name&gt;.*)\.csv"]]
+| join type=outer host 
+    [| rest splunk_server=local /servicesNS/-/-/configs/conf-distsearch 
+    | where match(title,"distributedSearch:dmc_search.+") 
+    | fields title servers 
+    | rename title as search_head_group 
+    | eval servers=split(servers,",") 
+    | mvexpand servers 
+    | rename servers as host_ip 
+    | rex field=host_ip "(?&lt;host_ip&gt;.*):8089" 
+    | join type=outer host_ip 
+        [| rest splunk_server=local /servicesNS/-/-/search/distributed/peers 
+        | fields title host 
+        | rex field=title "(?&lt;host_ip&gt;.*):8089" 
+        | fields host host_ip]]
+ 
+| eval reason=if((isnotnull(transform) OR isnotnull(savedsearch_name)),"yes","no") 
+  | rename search_head_group as splunk_server_group | rex field=splunk_server_group "distributedSearch:(?&lt;splunk_server_group&gt;.*)" | search  $splunk_server_group_tok$  | dedup lookup_name appname owner splunk_server_group| fields - splunk_server_group
+| fields lookup_name reason | rename reason as "Blacklist needed?" | eval lookup_name=lookup_name.".csv"]</query>
+          <earliest>-15d@d</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <set token="lookup_name_tok">$row.lookup_name$</set>
+        </drilldown>
+      </table>
+    </panel>
+    <panel depends="$lookup_name_tok$">
+      <table>
+        <title>Lookup Details</title>
+        <search>
+          <query>index=_audit action=add OR action=update* OR action=delete path="*lookups/$lookup_name_tok$*" host!=*dpl* NOT isdir=1 path!=*lookup_file_backups*
+| join type=outer host 
+    [| rest splunk_server=local /servicesNS/-/-/configs/conf-distsearch 
+    | where match(title,"distributedSearch:dmc_search.+") 
+    | fields title servers 
+    | rename title as search_head_group 
+    | eval servers=split(servers,",") 
+    | mvexpand servers 
+    | rename servers as host_ip 
+    | rex field=host_ip "(?&lt;host_ip&gt;.*):8089" 
+    | join type=outer host_ip 
+        [| rest splunk_server=local /servicesNS/-/-/search/distributed/peers 
+        | fields title host 
+        | rex field=title "(?&lt;host_ip&gt;.*):8089" 
+        | fields host host_ip]]
+        | rename search_head_group as splunk_server_group | rex field=splunk_server_group "distributedSearch:(?&lt;splunk_server_group&gt;.*)" | search  $splunk_server_group_tok$  | dedup path, splunk_server_group| fields - splunk_server_group
+| rex field=path ".*\/(?&lt;lookup_name&gt;[^\.]+\.csv)"
+| chart sparkline count by action, lookup_name</query>
+          <earliest>-30d@d</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Saved searches with large lookups that shouldn't be blacklisted</title>
+      <table>
+        <title>These are lookups referred to in a | lookup  or automatic lookup and thus need to be in the search bundle</title>
+        <search>
+          <query>|  rest  /servicesNS/-/-/saved/searches $splunk_server_group_tok$
+ | fields title search eai:acl.owner eai:acl.app splunk_server splunk_server_group | rename eai:acl.app as appname, eai:acl.owner as owner splunk_server as host
+ 
+ 
+ | where match(search,"\|\s*lookup") AND NOT match(search,"\|\s*lookup\s+local\s*=\s*true") | dedup title appname
+| rex field=search max_match=0 "\|\s*lookup\s+(?&lt;lookup_names&gt;\S+)" 
+| mvexpand lookup_names | rename lookup_names as lookup_name, title as savedsearch_name
+| rex field=lookup_name "(?&lt;lookup_name&gt;.*)\.csv"
+| append [|  rest $splunk_server_group_tok$ /servicesNS/-/-/data/props/lookups  | rename eai:acl.app as appname, eai:acl.owner as owner | fields transform appname owner splunk_server | rename splunk_server as host | join type=outer transform [|  rest  /servicesNS/-/-/data/transforms/lookups $splunk_server_group_tok$ |fields title filename | rename title as transform, filename as lookup_name | rex field=lookup_name "(?&lt;lookup_name&gt;.*)\.csv"]]
+| join type=outer host 
+    [| rest splunk_server=local /servicesNS/-/-/configs/conf-distsearch 
+    | where match(title,"distributedSearch:dmc_search.+") 
+    | fields title servers 
+    | rename title as search_head_group 
+    | eval servers=split(servers,",") 
+    | mvexpand servers 
+    | rename servers as host_ip 
+    | rex field=host_ip "(?&lt;host_ip&gt;.*):8089" 
+    | join type=outer host_ip 
+        [| rest splunk_server=local /servicesNS/-/-/search/distributed/peers 
+        | fields title host 
+        | rex field=title "(?&lt;host_ip&gt;.*):8089" 
+        | fields host host_ip]]
+ 
+| eval reason=case((isnotnull(transform) AND isnotnull(savedsearch_name)),"automatic lookup:".transform." and savedsearch:".savedsearch_name,isnotnull(transform),"automatic lookup:".transform,1==1,"savedsearch:".savedsearch_name)
+  | rename search_head_group as splunk_server_group | rex field=splunk_server_group "distributedSearch:(?&lt;splunk_server_group&gt;.*)" | search  $splunk_server_group_tok$  | dedup lookup_name appname owner splunk_server_group| fields - splunk_server_group
+| fields lookup_name reason  appname owner</query>
+          <earliest>-24h@h</earliest>
+          <latest>now</latest>
+          <sampleRatio>1</sampleRatio>
+        </search>
+        <option name="count">20</option>
+        <option name="dataOverlayMode">none</option>
+        <option name="drilldown">none</option>
+        <option name="percentagesRow">false</option>
+        <option name="refresh.display">progressbar</option>
+        <option name="rowNumbers">false</option>
+        <option name="totalsRow">false</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+</form>
